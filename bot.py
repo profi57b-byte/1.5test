@@ -233,6 +233,7 @@ def get_main_menu_keyboard(is_director=False):
             [KeyboardButton(text="📋 Сверка часов")],  # ← НОВОЕ
             [KeyboardButton(text="ℹ️ О боте")]
         ]
+
     else:
         # полное меню для сотрудников
         keyboard = [

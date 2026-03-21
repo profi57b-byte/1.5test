@@ -1607,6 +1607,7 @@ async def _record_hours_and_check_complete(director_id: int, employee_name: str,
     """Записывает подтверждённые часы и проверяет, все ли ответили."""
     session = hours_check_sessions.get(director_id)
     if not session:
+        logger.warning(f"_record_hours_and_check_complete: сессия для директора {director_id} не найдена")
         return
 
     session['confirmed'][employee_name] = hours
@@ -1614,27 +1615,26 @@ async def _record_hours_and_check_complete(director_id: int, employee_name: str,
     confirmed_count = len(session['confirmed'])
     total_count = session['total']
 
+    logger.info(f"Сверка часов: подтверждено {confirmed_count}/{total_count} (директор {director_id})")
+
     if confirmed_count < total_count:
         return  # ещё не все ответили
 
     # Все ответили — формируем итоговое сообщение
+    import calendar
     month_name = session['month_name']
     month = session['month']
     year = session['year']
 
-    import calendar
     days_in_month = calendar.monthrange(year, month)[1]
     expected_total = days_in_month * 14
-
     actual_total = sum(session['confirmed'].values())
 
-    # Сортируем по убыванию часов
     sorted_employees = sorted(session['confirmed'].items(), key=lambda x: x[1], reverse=True)
 
     lines = []
     for emp, h in sorted_employees:
         lines.append(f"  • {emp} — <b>{h} ч</b>")
-
     employees_block = "\n".join(lines)
 
     if actual_total == expected_total:
@@ -1660,10 +1660,10 @@ async def _record_hours_and_check_complete(director_id: int, employee_name: str,
 
     try:
         await bot.send_message(director_id, summary, parse_mode="HTML")
+        logger.info(f"Сводка сверки отправлена директору {director_id}")
     except Exception as e:
         logger.error(f"Ошибка отправки итогов сверки руководителю {director_id}: {e}")
 
-    # Чистим сессию
     hours_check_sessions.pop(director_id, None)
 
 # ============================================================
@@ -1708,6 +1708,11 @@ async def hours_check_broadcast(message: types.Message, state: FSMContext):
             skipped_count += 1
             continue
 
+        # Пропускаем самого руководителя — он не должен сам себе подтверждать часы
+        if employee_user_id == user_id:
+            skipped_count += 1
+            continue
+
         try:
             stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
             hours = int(stats['total_hours']) if stats else 0
@@ -1745,11 +1750,20 @@ async def hours_check_broadcast(message: types.Message, state: FSMContext):
                 'message_id': sent_msg.message_id
             }
             sent_count += 1
-            hours_check_sessions[user_id]['total'] += 1  # ← НОВОЕ
+            hours_check_sessions[user_id]['total'] += 1
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
             skipped_count += 1
+
+        # Если никому не отправили — сразу сообщаем директору
+    if sent_count == 0:
+        hours_check_sessions.pop(user_id, None)
+        await message.answer(
+            f"⚠️ Нет сотрудников с часами за <b>{month_name} {year}</b> для сверки.",
+            parse_mode="HTML"
+        )
+        return
 
     await message.answer(
         f"✅ <b>Рассылка завершена</b>\n\n"

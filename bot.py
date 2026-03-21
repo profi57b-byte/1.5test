@@ -40,6 +40,8 @@ access_control = AccessControl()
 bot_logger = BotLogger(bot, LOG_CHAT_ID)
 # Словарь активных проверок часов: user_id сотрудника -> данные проверки
 pending_hour_checks: dict = {}
+# Сессия сверки часов: director_id -> {всего сотрудников, подтверждённые данные}
+hours_check_sessions: dict = {}
 
 MONTH_NAMES_RU = {
     1: 'Январь', 2: 'Февраль', 3: 'Март', 4: 'Апрель',
@@ -1601,6 +1603,68 @@ async def back_to_menu_button(message: types.Message, state: FSMContext):
         reply_markup=get_main_menu_keyboard(is_director)
     )
 
+async def _record_hours_and_check_complete(director_id: int, employee_name: str, hours: int):
+    """Записывает подтверждённые часы и проверяет, все ли ответили."""
+    session = hours_check_sessions.get(director_id)
+    if not session:
+        return
+
+    session['confirmed'][employee_name] = hours
+
+    confirmed_count = len(session['confirmed'])
+    total_count = session['total']
+
+    if confirmed_count < total_count:
+        return  # ещё не все ответили
+
+    # Все ответили — формируем итоговое сообщение
+    month_name = session['month_name']
+    month = session['month']
+    year = session['year']
+
+    import calendar
+    days_in_month = calendar.monthrange(year, month)[1]
+    expected_total = days_in_month * 14
+
+    actual_total = sum(session['confirmed'].values())
+
+    # Сортируем по убыванию часов
+    sorted_employees = sorted(session['confirmed'].items(), key=lambda x: x[1], reverse=True)
+
+    lines = []
+    for emp, h in sorted_employees:
+        lines.append(f"  • {emp} — <b>{h} ч</b>")
+
+    employees_block = "\n".join(lines)
+
+    if actual_total == expected_total:
+        check_line = f"✅ Сумма сходится: <b>{actual_total} ч</b> = {days_in_month} дн × 14 ч"
+    else:
+        diff = actual_total - expected_total
+        sign = "+" if diff > 0 else ""
+        check_line = (
+            f"⚠️ Сумма <b>не сходится</b>!\n"
+            f"  Фактически: <b>{actual_total} ч</b>\n"
+            f"  Ожидалось: <b>{expected_total} ч</b> ({days_in_month} дн × 14 ч)\n"
+            f"  Расхождение: <b>{sign}{diff} ч</b>"
+        )
+
+    summary = (
+        f"📋 <b>Сверка часов за {month_name} {year} завершена</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{employees_block}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Итого: <b>{actual_total} ч</b> / {confirmed_count} сотрудников\n\n"
+        f"{check_line}"
+    )
+
+    try:
+        await bot.send_message(director_id, summary, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка отправки итогов сверки руководителю {director_id}: {e}")
+
+    # Чистим сессию
+    hours_check_sessions.pop(director_id, None)
 
 # ============================================================
 # ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
@@ -1624,6 +1688,15 @@ async def hours_check_broadcast(message: types.Message, state: FSMContext):
         return
 
     await message.answer("🔄 Начинаю рассылку запросов на сверку часов...")
+
+    # Сбрасываем сессию для этого руководителя
+    hours_check_sessions[user_id] = {
+        'total': 0,  # сколько всего сотрудников ждём
+        'confirmed': {},  # employee_name -> hours
+        'month_name': month_name,
+        'month': month,
+        'year': year
+    }
 
     sent_count = 0
     skipped_count = 0
@@ -1672,6 +1745,7 @@ async def hours_check_broadcast(message: types.Message, state: FSMContext):
                 'message_id': sent_msg.message_id
             }
             sent_count += 1
+            hours_check_sessions[user_id]['total'] += 1  # ← НОВОЕ
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
@@ -1970,7 +2044,6 @@ async def shift_counter_updater():
 
 @dp.callback_query(F.data == "hr_yes")
 async def hours_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
-    """Сотрудник подтверждает часы из графика."""
     user_id = callback.from_user.id
     check = pending_hour_checks.get(user_id)
 
@@ -1993,30 +2066,20 @@ async def hours_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Подтверждаем сотруднику
     await callback.message.answer(
         f"✅ <b>Данные подтверждены.</b>\n\n"
-        f"Ваши часы за <b>{month_name} {year}</b> — <b>{hours:.0f} ч</b> — переданы руководителю.",
+        f"Ваши часы за <b>{month_name} {year}</b> — <b>{hours} ч</b> — переданы руководителю.",
         parse_mode="HTML"
     )
-
-    # Уведомляем руководителя
-    try:
-        await bot.send_message(
-            director_id,
-            f"✅ <b>{employee_name}</b> подтвердил(а) количество часов "
-            f"за <b>{month_name} {year}</b>: <b>{hours:.0f} ч</b>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось уведомить руководителя {director_id}: {e}")
 
     pending_hour_checks.pop(user_id, None)
     await callback.answer()
     await bot_logger.log_action(
         callback.from_user.username or str(user_id),
-        f"Подтвердил(а) часы за {month_name} {year}: {hours:.0f} ч"
+        f"Подтвердил(а) часы за {month_name} {year}: {hours} ч"
     )
+
+    await _record_hours_and_check_complete(director_id, employee_name, hours)
 
 
 @dp.callback_query(F.data == "hr_no")
@@ -2052,7 +2115,7 @@ async def hours_confirm_no(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"✏️ Введите количество часов за "
         f"<b>{check['month_name']} {check['year']}</b>.\n\n"
-        f"Пример: <code>122</code> или <code>85.5</code>",
+        f"Пример: <code>122</code> или <code>137</code> (целое число)",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -2071,8 +2134,7 @@ async def process_entering_hours(message: types.Message, state: FSMContext):
     if not text.isdigit():
         await message.answer(
             f"❌ <b>Некорректный ввод.</b>\n\n"
-            f"Пожалуйста, введите <b>целое число</b> часов (например: <code>122</code>).\n"
-            f"Допустимый диапазон: от 0 до 744.",
+            f"Пожалуйста, введите <b>целое число</b> часов (например: <code>122</code>)",
             parse_mode="HTML"
         )
         return
@@ -2123,7 +2185,6 @@ async def hours_confirm_pending_text(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "hr_final_yes")
 async def hours_final_confirm_yes(callback: types.CallbackQuery, state: FSMContext):
-    """Сотрудник подтверждает введённые вручную часы."""
     user_id = callback.from_user.id
     user_data = await state.get_data()
 
@@ -2143,32 +2204,21 @@ async def hours_final_confirm_yes(callback: types.CallbackQuery, state: FSMConte
     except Exception:
         pass
 
-    # Подтверждаем сотруднику
     await callback.message.answer(
         f"✅ <b>Данные успешно переданы руководителю!</b>\n\n"
-        f"Ваши часы за <b>{month_name} {year}</b>: <b>{hours:.0f} ч</b>",
+        f"Ваши часы за <b>{month_name} {year}</b>: <b>{hours} ч</b>",
         parse_mode="HTML"
     )
-
-    # Уведомляем руководителя
-    try:
-        await bot.send_message(
-            director_id,
-            f"✏️ <b>{employee_name}</b> указал(а) количество часов "
-            f"за <b>{month_name} {year}</b>: <b>{hours:.0f} ч</b>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось уведомить руководителя {director_id}: {e}")
 
     pending_hour_checks.pop(user_id, None)
     await state.set_state(UserStates.main_menu)
     await callback.answer()
     await bot_logger.log_action(
         callback.from_user.username or str(user_id),
-        f"Указал(а) исправленные часы за {month_name} {year}: {hours:.0} ч"
+        f"Указал(а) исправленные часы за {month_name} {year}: {hours} ч"
     )
 
+    await _record_hours_and_check_complete(director_id, employee_name, hours)
 
 @dp.callback_query(F.data == "hr_final_no")
 async def hours_final_confirm_no(callback: types.CallbackQuery, state: FSMContext):

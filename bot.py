@@ -1,7 +1,3 @@
-"""
-Telegram бот для управления графиком смен L1.5
-Версия 2.0 - финальная
-"""
 import os
 import logging
 from datetime import datetime, timedelta, time
@@ -1559,10 +1555,13 @@ async def show_about(message: types.Message):
     """Показать информацию о боте"""
     about_text = (
         "🤖 <b>Бот управления графиком L1.5</b>\n\n"
-        "📊 Версия: 1.8\n\n"
+        "📊 Версия: 2.2.1 (21.03.2026)\n\n"
         "🔹 <b>Возможности:</b>\n"
         "• Просмотр расписания смен\n"
+        "• «Рублемер»\n"
         "• Информация о текущем дежурном\n"
+        "• Сверка часов в конце месяца\n"
+        "• Уведомления о предстоящих сменах\n"
         "• Статистика работы\n\n"
         "💡 По вопросам обращайтесь к @photon_27."
     )
@@ -1779,17 +1778,15 @@ async def hours_check_broadcast(message: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(None), F.text)
 async def auto_start(message: types.Message, state: FSMContext):
-    """Автоматический вход для пользователей из БД."""
+    """Автоматический вход для пользователей из БД после перезапуска."""
     has_access = await access_control.check_access(message.from_user.id)
     if not has_access:
         return
 
-    # Если руководитель — восстанавливаем состояние и перенаправляем
     is_director = await access_control.is_director(message.from_user.id)
     if is_director:
         await state.update_data(is_director=True)
         await state.set_state(UserStates.main_menu)
-        # Повторно вызываем нужный обработчик по тексту кнопки
         if message.text == "📋 Сверка часов":
             await hours_check_broadcast(message, state)
         elif message.text == "📊 По сотрудникам":
@@ -1798,7 +1795,7 @@ async def auto_start(message: types.Message, state: FSMContext):
             await department_stats_start(message, state)
         elif message.text == "👥 Кто на смене?":
             await show_current_shift(message, state)
-        elif message.text in ("📅 Сегодня",):
+        elif message.text == "📅 Сегодня":
             await cmd_today(message, state)
         elif message.text == "📅 Завтра":
             await cmd_tomorrow(message, state)
@@ -1812,18 +1809,35 @@ async def auto_start(message: types.Message, state: FSMContext):
         return
 
     user_data_db = await db.get_user(message.from_user.id)
-    if not user_data_db:
-        await message.answer("👋 Для начала работы используйте /start")
+    if not user_data_db or not user_data_db.get('employee_name'):
+        await message.answer(
+            "👋 Для начала работы используйте /start"
+        )
         return
 
-    await state.update_data(employee_name=user_data_db['employee_name'])
+    # Восстанавливаем состояние из БД
+    employee_name = user_data_db['employee_name']
+    await state.update_data(employee_name=employee_name)
     await state.set_state(UserStates.main_menu)
-    await message.answer(
-        f"👋 С возвращением, {user_data_db['employee_name']}!\n\n"
-        f"Повторите ваш запрос, пожалуйста.\n"
-        f"Можете изменить настройки через меню ⚙️",
-        reply_markup=get_main_menu_keyboard(False)
-    )
+
+    # Сразу выполняем команду — не просим повторить
+    if message.text == "📅 Сегодня":
+        await cmd_today(message, state)
+    elif message.text == "📅 Завтра":
+        await cmd_tomorrow(message, state)
+    elif message.text == "📅 Неделя":
+        await cmd_week(message, state)
+    elif message.text == "👥 Кто на смене?":
+        await show_current_shift(message, state)
+    elif message.text == "📊 Статистика":
+        await cmd_stats(message, state)
+    elif message.text == "⚙️ Настройки":
+        await cmd_settings(message, state)
+    else:
+        await message.answer(
+            f"👋 С возвращением, {employee_name}!",
+            reply_markup=get_main_menu_keyboard(False)
+        )
 
 # Callback обработчики
 @dp.callback_query(F.data.startswith("cal_nav:"))
@@ -2029,6 +2043,14 @@ async def shift_counter_updater():
                     )
                     await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
                     to_remove.append(user_id)
+
+                    # Логируем завершение
+                    await bot_logger.log_action(
+                        f"user_{user_id}",
+                        f"✅ Рублемер завершён. Итого: {total_earned:.2f} руб. "
+                        f"Смена: {shift_start.strftime('%H:%M')}–{shift_end.strftime('%H:%M')}. "
+                        f"Сообщение откреплено (ID: {message_id})"
+                    )
                 else:
                     # Смена идёт — обновляем счётчик
                     elapsed_minutes = (now - shift_start).total_seconds() / 60
@@ -2048,6 +2070,15 @@ async def shift_counter_updater():
                         text=text,
                         parse_mode="HTML"
                     )
+
+                    # Логируем каждые 30 минут (чтобы не спамить)
+                    if int(elapsed_minutes) % 30 == 0 and int(elapsed_minutes) > 0:
+                        await bot_logger.log_action(
+                            f"user_{user_id}",
+                            f"⏱ Рублемер: {earned:.2f} руб., осталось {rem_hours} ч. {rem_minutes:02d} мин. "
+                            f"(сообщение ID: {message_id})"
+                        )
+
             except Exception as e:
                 logger.debug(f"shift_counter_updater: {e}")
 
@@ -2484,8 +2515,18 @@ async def reminder_checker():
                                     'shift_start': shift_start,
                                     'shift_end': shift_end
                                 }
-                                await bot.pin_chat_message(chat_id=msg.chat.id, message_id=msg.message_id,
-                                                           disable_notification=True)
+                                await bot.pin_chat_message(
+                                    chat_id=msg.chat.id,
+                                    message_id=msg.message_id,
+                                    disable_notification=True
+                                )
+                                # ← ДОБАВИТЬ:
+                                await bot_logger.log_action(
+                                    f"user_{user_id}",
+                                    f"⏱ [{employee_name}] Запущен рублемер. "
+                                    f"Смена: {shift_start.strftime('%H:%M')}–{shift_end.strftime('%H:%M')}. "
+                                    f"Сообщение закреплено (ID: {msg.message_id})"
+                                )
                                 break
                         except Exception as e:
                             logger.debug(f"Ошибка запуска счётчика смены: {e}")

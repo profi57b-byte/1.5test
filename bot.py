@@ -228,14 +228,11 @@ def get_main_menu_keyboard(is_director=False):
         keyboard = [
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],
-            [KeyboardButton(text="👥 Кто на смене?")],
+            [KeyboardButton(text="👥 Кто на смене?"), KeyboardButton(text="📋 Сверка часов")],
             [KeyboardButton(text="📊 По сотрудникам"), KeyboardButton(text="📊 Отдел")],
-            [KeyboardButton(text="📋 Сверка часов")],  # ← НОВОЕ
             [KeyboardButton(text="ℹ️ О боте")]
         ]
-
     else:
-        # полное меню для сотрудников
         keyboard = [
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📅 Завтра")],
             [KeyboardButton(text="📅 Неделя"), KeyboardButton(text="📅 Дата")],

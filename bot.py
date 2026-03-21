@@ -2330,15 +2330,64 @@ async def hours_check_reminder():
         except Exception as e:
             logger.error(f"Ошибка в hours_check_reminder: {e}")
 
+async def seed_users():
+    """Предзаполняет БД заранее известными пользователями, ролями и именами."""
+
+    PREDEFINED_USERS = [
+        # (user_id, employee_name, role)  role: 'admin', 'director', 'user'
+        (662128557,  'Гришина Светлана',    'admin'),
+        (1791773663, 'Щемелинин Владислав', 'director'),
+        (1023700628, 'Щемелинин Владислав', 'director'),
+        (5205557617, 'Щемелинин Владислав', 'director'),
+        (721087112,  'Червякова Ольга',     'user'),
+        (902098427,  'Мишина Анна',         'user'),
+        (907480648,  'Кузнецова Алиса',     'user'),
+        (1141957939, 'Белов Дмитрий',       'user'),
+        (1232409927, 'Андреева Варвара',    'user'),
+        (1950565293, 'Толкачев Егор',       'user'),
+        (1949489221, 'Тимохина Дарья',      'user'),
+    ]
+
+    admin_id = access_control.admin_id
+
+    for user_id, employee_name, role in PREDEFINED_USERS:
+        try:
+            # Сохраняем в users (имя сотрудника)
+            await db.save_user(
+                user_id=user_id,
+                username=employee_name,
+                is_l15=True,
+                employee_name=employee_name
+            )
+
+            # Выдаём доступ в access_list
+            await access_control.grant_access(
+                user_id=user_id,
+                username=employee_name,
+                granted_by=admin_id
+            )
+
+            # Назначаем роль директора
+            if role == 'director':
+                await access_control.add_director(user_id, added_by=admin_id)
+
+            logger.info(f"Предзаполнен: {employee_name} (ID: {user_id}, роль: {role})")
+
+        except Exception as e:
+            logger.error(f"Ошибка предзаполнения пользователя {user_id}: {e}")
+
+    logger.info("Предзаполнение пользователей завершено.")
+
 async def main():
     """Запуск бота"""
     # Инициализация БД
     await db.init_db()
     await access_control.init_db()
+    await seed_users()
 
     # Запускаем фоновую задачу
     asyncio.create_task(reminder_checker())
-    asyncio.create_task(hours_check_reminder())  # ← НОВОЕ
+    asyncio.create_task(hours_check_reminder())
     asyncio.create_task(shift_counter_updater())
 
     logger.info("Бот запущен")

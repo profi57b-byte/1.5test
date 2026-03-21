@@ -1601,40 +1601,144 @@ async def back_to_menu_button(message: types.Message, state: FSMContext):
         reply_markup=get_main_menu_keyboard(is_director)
     )
 
+
+# ============================================================
+# ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
+# ============================================================
+
+@dp.message(StateFilter(UserStates.main_menu), F.text == "📋 Сверка часов")
+async def hours_check_broadcast(message: types.Message, state: FSMContext):
+    """Руководитель инициирует сверку часов со всеми сотрудниками."""
+    user_id = message.from_user.id
+    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
+    if not is_dir:
+        await message.answer("⛔ Эта функция доступна только руководителям.")
+        return
+
+    now = moscow_now()
+    year, month = now.year, now.month
+    month_name = MONTH_NAMES_RU[month]
+
+    all_users = await db.get_all_users()
+    if not all_users:
+        await message.answer("⚠️ Нет зарегистрированных сотрудников.")
+        return
+
+    await message.answer("🔄 Начинаю рассылку запросов на сверку часов...")
+
+    sent_count = 0
+    skipped_count = 0
+
+    for user in all_users:
+        employee_user_id = user['user_id']
+        employee_name = user.get('employee_name')
+        if not employee_name:
+            skipped_count += 1
+            continue
+
+        # Считаем часы за текущий месяц
+        try:
+            stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
+            hours = stats['total_hours'] if stats else 0.0
+        except Exception as e:
+            logger.error(f"Ошибка получения часов для {employee_name}: {e}")
+            skipped_count += 1
+            continue
+
+        if hours < 1:
+            skipped_count += 1
+            continue
+
+        # Сохраняем данные для обработки ответа
+        pending_hour_checks[employee_user_id] = {
+            'director_id': user_id,
+            'hours': hours,
+            'month_name': month_name,
+            'month': month,
+            'year': year,
+            'employee_name': employee_name
+        }
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да", callback_data="hr_yes"),
+            InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_no")
+        ]])
+
+        try:
+            await bot.send_message(
+                employee_user_id,
+                f"📋 <b>Сообщение от руководителя:</b>\n\n"
+                f"Привет! У тебя за <b>{month_name} {year}</b> — "
+                f"<b>{hours:.1f} ч</b>.\n\nДанные верны?",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            sent_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
+            pending_hour_checks.pop(employee_user_id, None)
+            skipped_count += 1
+
+    await message.answer(
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"📨 Отправлено: <b>{sent_count}</b>\n"
+        f"⏭ Пропущено (нет часов / не зарегистрированы): <b>{skipped_count}</b>",
+        parse_mode="HTML"
+    )
+    await bot_logger.log_action(
+        message.from_user.username or str(user_id),
+        f"🎯 Инициировал сверку часов за {month_name} {year} (отправлено: {sent_count})"
+    )
+
+
 @dp.message(F.text)
 async def auto_start(message: types.Message, state: FSMContext):
     """Автоматический вход для пользователей из БД."""
-    # Проверка доступа (middleware уже проверит, но для надёжности)
     has_access = await access_control.check_access(message.from_user.id)
     if not has_access:
-        return  # middleware отправит сообщение о блокировке
+        return
+
+    # Если руководитель — восстанавливаем состояние и перенаправляем
+    is_director = await access_control.is_director(message.from_user.id)
+    if is_director:
+        await state.update_data(is_director=True)
+        await state.set_state(UserStates.main_menu)
+        # Повторно вызываем нужный обработчик по тексту кнопки
+        if message.text == "📋 Сверка часов":
+            await hours_check_broadcast(message, state)
+        elif message.text == "📊 По сотрудникам":
+            await director_stats_choose_employee(message, state)
+        elif message.text == "📊 Отдел":
+            await department_stats_start(message, state)
+        elif message.text == "👥 Кто на смене?":
+            await show_current_shift(message, state)
+        elif message.text in ("📅 Сегодня",):
+            await cmd_today(message, state)
+        elif message.text == "📅 Завтра":
+            await cmd_tomorrow(message, state)
+        elif message.text == "📅 Неделя":
+            await cmd_week(message, state)
+        else:
+            await message.answer(
+                "📋 Главное меню:",
+                reply_markup=get_main_menu_keyboard(is_director=True)
+            )
+        return
 
     user_data_db = await db.get_user(message.from_user.id)
     if not user_data_db:
-        # Пользователь не в БД – предлагаем /start
         await message.answer("👋 Для начала работы используйте /start")
         return
 
-    # Есть в БД – восстанавливаем
     await state.update_data(employee_name=user_data_db['employee_name'])
     await state.set_state(UserStates.main_menu)
-    user_id = message.from_user.id
-    is_director = await access_control.is_director(user_id)
     await message.answer(
         f"👋 С возвращением, {user_data_db['employee_name']}!\n\n"
         f"Повторите ваш запрос, пожалуйста.\n"
         f"Можете изменить настройки через меню ⚙️",
-        reply_markup=get_main_menu_keyboard(is_director)
+        reply_markup=get_main_menu_keyboard(False)
     )
-
-@dp.message(StateFilter(UserStates.main_menu))
-async def handle_unknown_message(message: types.Message):
-    """Обработка неизвестных команд"""
-    await message.answer(
-        "❓ Не знаю такой команды.\n\n"
-        "Используйте кнопки меню или команду /help для просмотра доступных команд."
-    )
-
 
 # Callback обработчики
 @dp.callback_query(F.data.startswith("cal_nav:"))
@@ -1866,96 +1970,6 @@ async def shift_counter_updater():
             active_shift_counters.pop(user_id, None)
 
         await asyncio.sleep(5)
-
-# ============================================================
-# ФУНКЦИОНАЛ: СВЕРКА ЧАСОВ (для руководителей)
-# ============================================================
-
-@dp.message(StateFilter(UserStates.main_menu), F.text == "📋 Сверка часов")
-async def hours_check_broadcast(message: types.Message, state: FSMContext):
-    """Руководитель инициирует сверку часов со всеми сотрудниками."""
-    user_id = message.from_user.id
-    is_dir = await access_control.is_director(user_id) or access_control.is_admin(user_id)
-    if not is_dir:
-        await message.answer("⛔ Эта функция доступна только руководителям.")
-        return
-
-    now = moscow_now()
-    year, month = now.year, now.month
-    month_name = MONTH_NAMES_RU[month]
-
-    all_users = await db.get_all_users()
-    if not all_users:
-        await message.answer("⚠️ Нет зарегистрированных сотрудников.")
-        return
-
-    await message.answer("🔄 Начинаю рассылку запросов на сверку часов...")
-
-    sent_count = 0
-    skipped_count = 0
-
-    for user in all_users:
-        employee_user_id = user['user_id']
-        employee_name = user.get('employee_name')
-        if not employee_name:
-            skipped_count += 1
-            continue
-
-        # Считаем часы за текущий месяц
-        try:
-            stats = excel_parser.get_employee_stats_for_month(employee_name, year, month)
-            hours = stats['total_hours'] if stats else 0.0
-        except Exception as e:
-            logger.error(f"Ошибка получения часов для {employee_name}: {e}")
-            skipped_count += 1
-            continue
-
-        if hours < 1:
-            skipped_count += 1
-            continue
-
-        # Сохраняем данные для обработки ответа
-        pending_hour_checks[employee_user_id] = {
-            'director_id': user_id,
-            'hours': hours,
-            'month_name': month_name,
-            'month': month,
-            'year': year,
-            'employee_name': employee_name
-        }
-
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Да", callback_data="hr_yes"),
-            InlineKeyboardButton(text="✏️ Нет, изменить", callback_data="hr_no")
-        ]])
-
-        try:
-            await bot.send_message(
-                employee_user_id,
-                f"📋 <b>Сообщение от руководителя:</b>\n\n"
-                f"Привет! У тебя за <b>{month_name} {year}</b> — "
-                f"<b>{hours:.1f} ч</b>.\n\nДанные верны?",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-            sent_count += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение пользователю {employee_user_id}: {e}")
-            pending_hour_checks.pop(employee_user_id, None)
-            skipped_count += 1
-
-    await message.answer(
-        f"✅ <b>Рассылка завершена</b>\n\n"
-        f"📨 Отправлено: <b>{sent_count}</b>\n"
-        f"⏭ Пропущено (нет часов / не зарегистрированы): <b>{skipped_count}</b>",
-        parse_mode="HTML"
-    )
-    await bot_logger.log_action(
-        message.from_user.username or str(user_id),
-        f"🎯 Инициировал сверку часов за {month_name} {year} (отправлено: {sent_count})"
-    )
-
 
 @dp.callback_query(F.data == "hr_yes")
 async def hours_confirm_yes(callback: types.CallbackQuery, state: FSMContext):

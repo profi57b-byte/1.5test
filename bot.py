@@ -105,7 +105,6 @@ print(f"📊 Загружен Excel файл: {EXCEL_FILE}")
 @dp.message.middleware()
 async def log_all_messages_middleware(handler, event: types.Message, data: dict):
     user_id = event.from_user.id
-    # Определяем роль пользователя
     if access_control.is_admin(user_id):
         role = "👑 АДМИН"
     elif await access_control.is_director(user_id):
@@ -113,11 +112,24 @@ async def log_all_messages_middleware(handler, event: types.Message, data: dict)
     else:
         role = "👤 ПОЛЬЗОВАТЕЛЬ"
 
-    # Логируем сообщение (метод log_incoming_message должен быть в logger.py)
-    await bot_logger.log_incoming_message(event, role)
+    # Получаем имя сотрудника из БД для отображения в логах
+    employee_name = None
+    try:
+        user_db = await db.get_user(user_id)
+        if user_db and user_db.get('employee_name'):
+            employee_name = user_db['employee_name']
+    except Exception:
+        pass
 
-    # Передаём управление дальше по цепочке middleware
-    return await handler(event, data)
+    # Сохраняем входящее сообщение (не отправляем сразу)
+    await bot_logger.store_incoming(event, role, employee_name)
+
+    result = await handler(event, data)
+
+    # Если обработчик не вызвал flush_with_action — отправляем без действия
+    await bot_logger.flush_pending(user_id)
+
+    return result
 
 
 # Middleware для проверки доступа
@@ -327,8 +339,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     admin_text = " 👑 <b>(Админ)</b>" if is_admin else ""
     director_text = " 🎯 <b>(Руководитель)</b>" if is_director else ""
 
-    await bot_logger.log_action(
-        message.from_user.username or str(user_id),
+    await bot_logger.flush_with_action(
+        user_id,
         f"Запустил бота{' [ADMIN]' if is_admin else ''}{' [DIRECTOR]' if is_director else ''}"
     )
 
@@ -736,8 +748,8 @@ async def cmd_today(message: types.Message, state: FSMContext):
 
     await state.set_state(UserStates.main_menu)
 
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         "Запросил расписание на сегодня"
     )
 
@@ -782,8 +794,8 @@ async def cmd_tomorrow(message: types.Message, state: FSMContext):
 
     await state.set_state(UserStates.main_menu)
 
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         "Запросил расписание на завтра"
     )
 
@@ -828,8 +840,8 @@ async def cmd_week(message: types.Message, state: FSMContext):
 
     await state.set_state(UserStates.main_menu)
 
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         "Запросил расписание на неделю"
     )
 
@@ -873,10 +885,9 @@ async def cmd_drop_bot(message: types.Message):
         parse_mode="HTML"
     )
 
-    # Логируем действие
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
-        f"👑 [ADMIN] Инициировал остановку бота командой /drop"
+    await bot_logger.flush_with_action(
+        message.from_user.id,
+        "👑 [ADMIN] Инициировал остановку бота командой /drop"
     )
 
     # Даем время на отправку сообщения
@@ -930,9 +941,8 @@ async def cmd_broadcast(message: types.Message):
             logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
             fail_count += 1
 
-    # Логируем
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         f"📢 Отправил рассылку. Успешно: {success_count}, ошибок: {fail_count}"
     )
 
@@ -948,8 +958,8 @@ async def cmd_whoisnow(message: types.Message, state: FSMContext):
     """Команда: кто сейчас на смене"""
     await state.set_state(UserStates.main_menu)
 
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         "Запросил текущего дежурного"
     )
 
@@ -1076,8 +1086,8 @@ async def cmd_add_user(message: types.Message):
             parse_mode="HTML"
         )
 
-        await bot_logger.log_action(
-            message.from_user.username or str(message.from_user.id),
+        await bot_logger.flush_with_action(
+            message.from_user.id,
             f"👑 [ADMIN] Выдал доступ пользователю ID: {user_id}"
         )
 
@@ -1120,8 +1130,8 @@ async def cmd_revoke_user(message: types.Message):
             parse_mode="HTML"
         )
 
-        await bot_logger.log_action(
-            message.from_user.username or str(message.from_user.id),
+        await bot_logger.flush_with_action(
+            message.from_user.id,
             f"👑 [ADMIN] Отозвал доступ у пользователя ID: {user_id}"
         )
 
@@ -1167,8 +1177,8 @@ async def cmd_make_admin(message: types.Message):
             parse_mode="HTML"
         )
 
-        await bot_logger.log_action(
-            message.from_user.username or str(message.from_user.id),
+        await bot_logger.flush_with_action(
+            message.from_user.id,
             f"👑 [ADMIN] Назначил администратора ID: {user_id}"
         )
 
@@ -1240,8 +1250,8 @@ async def cmd_add_director(message: types.Message):
             parse_mode="HTML"
         )
 
-        await bot_logger.log_action(
-            message.from_user.username or str(message.from_user.id),
+        await bot_logger.flush_with_action(
+            message.from_user.id,
             f"👑 [ADMIN] Назначил руководителя ID: {user_id}"
         )
 
@@ -1289,8 +1299,8 @@ async def cmd_remove_director(message: types.Message):
             parse_mode="HTML"
         )
 
-        await bot_logger.log_action(
-            message.from_user.username or str(message.from_user.id),
+        await bot_logger.flush_with_action(
+            message.from_user.id,
             f"👑 [ADMIN] Снял руководителя ID: {user_id}"
         )
 
@@ -1413,8 +1423,8 @@ async def process_name_selection(message: types.Message, state: FSMContext):
             employee_name=message.text
         )
 
-        await bot_logger.log_action(
-            message.from_user.username or str(message.from_user.id),
+        await bot_logger.flush_with_action(
+            message.from_user.id,
             f"Выбрал имя: {message.text}"
         )
 
@@ -1523,8 +1533,8 @@ async def show_week_button(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserStates.main_menu), F.text == "📅 Дата")
 async def show_date_picker(message: types.Message, state: FSMContext):
     """Показать календарь для выбора даты"""
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         "Открыл календарь выбора даты"
     )
 
@@ -1580,8 +1590,8 @@ async def show_settings(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserStates.main_menu), F.text == "👤 Изменить имя")
 async def change_name_button(message: types.Message, state: FSMContext):
     """Изменить имя сотрудника"""
-    await bot_logger.log_action(
-        message.from_user.username or str(message.from_user.id),
+    await bot_logger.flush_with_action(
+        message.from_user.id,
         "Открыл меню изменения имени"
     )
 
@@ -2071,9 +2081,9 @@ async def shift_counter_updater():
                         parse_mode="HTML"
                     )
 
-                    # Логируем каждые 30 минут (чтобы не спамить)
+                    # Логируем каждые 30 минут только локально, без отправки в Telegram
                     if int(elapsed_minutes) % 30 == 0 and int(elapsed_minutes) > 0:
-                        await bot_logger.log_action(
+                        await bot_logger.log_action_silent(
                             f"user_{user_id}",
                             f"⏱ Рублемер: {earned:.2f} руб., осталось {rem_hours} ч. {rem_minutes:02d} мин. "
                             f"(сообщение ID: {message_id})"
